@@ -134,19 +134,113 @@ class Interpolator1DPCP(Interpolator1D):
 
 
 class Interpolator1DMonotoneConvex(Interpolator1D):
-    """HW7: implement your own monotone, convex IFR interpolator here."""
+    """Monotone convex piecewise-cubic Hermite interpolator with FLAT extrapolation.
+
+    On each interval [t_i, t_{i+1}] (h = width, D = secant slope) the cubic is
+        p(tau) = f_i + dL*tau + c2*tau^2 + c3*tau^3,
+        c2 = (2a - b)/h,  c3 = (b - a)/h^2,
+    where a = D - dL and b = dR - D are the end-slope deviations from the secant.
+
+    Shape conditions on one interval (p'' is linear, so check the two ends):
+        convex   <=>  a >= 0, b >= 0, a/2 <= b <= 2a
+        monotone <=>  a <= D (if D > 0)  or  b <= |D| (if D < 0); a = b = 0 if D = 0
+    Candidate node slopes are Bessel (3-point parabola) slopes, zero at local extrema,
+    and natural (p'' = 0) at the end nodes. Each interval then projects its own
+    (a, b) onto the feasible set, which always contains (0, 0) = linear. Hence the
+    result always interpolates, is continuous, and is monotone and convex on every
+    interval; C1 at a node is kept whenever the candidate slope is feasible on both
+    sides, otherwise a small slope kink is accepted.
+    """
 
     def __init__(self, axis1: np.ndarray, values: np.ndarray,
                  extrapolation_method: ExtrapMethod) -> None:
         super().__init__(axis1, values, InterpMethod.MONOTONE_CONVEX,
                          extrapolation_method)
-        # TODO: Prepare your interpolation method.
+        assert self.extrap_method_ == ExtrapMethod.FLAT
+        assert self.length_ >= 1
+
+        t = np.asarray(self.axis1_, dtype=float)
+        f = np.asarray(self.values_, dtype=float)
+        assert np.all(np.diff(t) > 0), "node times must be strictly increasing"
+        self.t_ = t
+        self.f_ = f
+        n = self.length_ - 1  # number of intervals
+
+        if n == 0:
+            self.dL_ = self.c2_ = self.c3_ = np.zeros(0)
+            self.cum_ = np.zeros(1)
+            return
+
+        h = np.diff(t)
+        delta = np.diff(f) / h
+
+        # Step 1: candidate (shared) node slopes.
+        d = np.zeros(n + 1)
+        if n >= 2:
+            d[1:-1] = (h[1:] * delta[:-1] + h[:-1] * delta[1:]) / (h[:-1] + h[1:])
+            d[1:-1][delta[:-1] * delta[1:] <= 0.0] = 0.0  # local extremum / flat
+            d[0] = 0.5 * (3.0 * delta[0] - d[1])          # natural end: p''(t_0) = 0
+            d[-1] = 0.5 * (3.0 * delta[-1] - d[-2])       # natural end: p''(t_n) = 0
+        else:
+            d[:] = delta[0]                               # two nodes: straight line
+
+        # Step 2: per-interval projection of (a, b) onto the feasible set.
+        a = delta - d[:-1]
+        b = d[1:] - delta
+        for i in range(n):
+            a[i], b[i] = self._project(a[i], b[i], delta[i])
+
+        self.h_ = h
+        self.dL_ = delta - a
+        self.dR_ = delta + b
+        self.c2_ = (2.0 * a - b) / h
+        self.c3_ = (b - a) / h**2
+
+        # Cumulative integral from t_0 to each node.
+        self.cum_ = np.concatenate(([0.0], np.cumsum(self._poly_integral(np.arange(n), h))))
+
+    @staticmethod
+    def _project(a: float, b: float, delta: float):
+        if delta == 0.0:
+            return 0.0, 0.0
+        a, b = max(a, 0.0), max(b, 0.0)        # no concave part
+        a, b = min(a, 2.0 * b), min(b, 2.0 * a)  # factor-2 band: p'' >= 0 at both ends
+        if delta > 0.0 and a > delta:            # monotone increasing: dL >= 0
+            a = delta
+        elif delta < 0.0 and b > -delta:         # monotone decreasing: dR <= 0
+            b = -delta
+        a, b = min(a, 2.0 * b), min(b, 2.0 * a)  # re-apply band after the cap
+        return a, b
+
+    def _poly_integral(self, idx, u):
+        """Integral of p_idx over [t_idx, t_idx + u]."""
+        return (self.f_[idx] * u + 0.5 * self.dL_[idx] * u**2
+                + self.c2_[idx] * u**3 / 3.0 + 0.25 * self.c3_[idx] * u**4)
+
+    def _interval(self, x: float) -> int:
+        return min(max(int(np.searchsorted(self.t_, x, side='right')) - 1, 0), self.length_ - 2)
+
+    def _antiderivative(self, x: float) -> float:
+        """F(x) = integral of f from t_0 to x (negative for x < t_0)."""
+        t0, tn = self.t_[0], self.t_[-1]
+        if x <= t0:
+            return self.f_[0] * (x - t0)
+        if x >= tn:
+            return self.cum_[-1] + self.f_[-1] * (x - tn)
+        i = self._interval(x)
+        return self.cum_[i] + self._poly_integral(i, x - self.t_[i])
 
     def interpolate(self, x: float) -> float:
-        raise NotImplementedError("HW7: implement interpolate")
+        if x <= self.t_[0]:
+            return float(self.f_[0])
+        if x >= self.t_[-1]:
+            return float(self.f_[-1])
+        i = self._interval(x)
+        tau = x - self.t_[i]
+        return float(self.f_[i] + tau * (self.dL_[i] + tau * (self.c2_[i] + tau * self.c3_[i])))
 
     def integrate(self, start_x: float, end_x: float) -> float:
-        raise NotImplementedError("HW7: implement integrate")
+        return float(self._antiderivative(end_x) - self._antiderivative(start_x))
 
     # Optional risk interface
     # The test cells for risk are not prepared but you can do it by your own.
